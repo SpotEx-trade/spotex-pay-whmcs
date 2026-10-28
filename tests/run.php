@@ -123,6 +123,14 @@ final class FakeHost implements Host
         return false;
     }
 
+    public function remember(int $invoiceId, string $transactionId): void
+    {
+        if (!isset($this->held[$invoiceId])) {
+            throw new Exception('declined without the lock');
+        }
+        $this->sessions[$invoiceId]['booked'][] = $transactionId;
+    }
+
     public function addPayment(int $invoiceId, string $transactionId, string $amount): void
     {
         if (!isset($this->held[$invoiceId])) {
@@ -283,16 +291,21 @@ check('a webhook counts only for the invoice\'s own session, mode, currency and 
     same(Invoices::eventAction(paidEvent('cs_t', [], true), $kept)[0], 'ignore', 'live money on an earlier test session');
     same(Invoices::eventAction(paidEvent('cs_t', [], false), $kept)[0], 'test', 'and test money on it is a test');
     same(Invoices::eventAction(paidEvent('cs_2', ['accepted_by' => 'auto']), $kept)[0], 'ignore', 'released by SpotEx, whatever the event says');
-    same(Invoices::eventAction(['type' => 'checkout.released'] + paidEvent('cs_2', ['status' => 'released']), $kept)[0], 'note');
+    $released = Invoices::eventAction(['type' => 'checkout.released'] + paidEvent('cs_2', ['status' => 'released']), $kept);
+    same($released[0], 'note', 'never declined: the rest arriving can still pay it');
+    same(strpos($released[1], 'NOT paid') !== false, true);
+    same(strpos(Invoices::eventAction(['type' => 'checkout.released'] + paidEvent('cs_2', ['status' => 'released', 'duplicate' => true]), $kept)[1], 'paid already') !== false, true, 'a released second payment is not chased');
+    same(strpos(Invoices::eventAction(['type' => 'checkout.extra'] + paidEvent('cs_2', ['status' => 'released']), $kept)[1], 'NOT paid') !== false, true, 'more on a released one is no extra');
     same(Invoices::eventAction(['type' => 'checkout.extra'] + paidEvent('cs_2'), $kept)[0], 'note');
     $held = Invoices::eventAction(['type' => 'checkout.partial'] + paidEvent('cs_2', ['duplicate' => true]), $kept);
     same(strpos($held[1], 'second payment') !== false, true, 'a held second payment is called that');
     same(Invoices::eventAction(paidEvent('cs_2', [], false), $kept)[0], 'ignore', 'a test event on a live invoice');
     same(Invoices::eventAction(paidEvent('cs_2', [], false), ['test' => true] + $kept)[0], 'test');
-    same(Invoices::eventAction(paidEvent('cs_2', ['currency' => 'USD']), $kept)[0], 'note');
-    same(Invoices::eventAction(paidEvent('cs_2', ['price' => '20.00']), $kept)[0], 'note');
+    same(Invoices::eventAction(paidEvent('cs_2', ['currency' => 'USD']), $kept)[0], 'decline');
+    same(Invoices::eventAction(paidEvent('cs_2', ['price' => '20.00']), $kept)[0], 'decline');
     same(Invoices::eventAction(paidEvent('cs_2', ['price' => '25']), $kept)[0], 'pay', '25 is 25.00');
-    same(Invoices::eventAction(paidEvent('cs_2', ['duplicate' => true]), $kept)[0], 'note');
+    same(Invoices::eventAction(paidEvent('cs_2', ['duplicate' => true]), $kept)[0], 'decline', 'a second payment: never added, then or later');
+    same(Invoices::eventAction(paidEvent('cs_2'), $kept)[3], 'EUR', 'the currency it was paid in goes with it');
     same(Invoices::eventAction(paidEvent('cs_2', ['status' => 'pending']), $kept)[0], 'ignore');
     same(Invoices::eventAction(paidEvent('cs_2', ['id' => '']), $kept)[0], 'ignore', 'no transaction id to book');
     same(Invoices::eventAction(['type' => 'checkout.partial'] + paidEvent('cs_2'), $kept)[0], 'note');
@@ -300,14 +313,18 @@ check('a webhook counts only for the invoice\'s own session, mode, currency and 
 });
 
 check('a payment is added once, only while the invoice still asks for exactly it', function () {
-    $pay = ['pay', 'Paid.', '25.00'];
-    same(Invoices::settle($pay, ['recorded' => false, 'status' => 'Unpaid', 'balance' => '25.00'])[0], 'add');
-    same(Invoices::settle($pay, ['recorded' => false, 'status' => 'Unpaid', 'balance' => '25'])[0], 'add');
-    same(Invoices::settle($pay, ['recorded' => true, 'status' => 'Paid', 'balance' => '0.00'])[0], 'ignore', 'added already');
-    same(Invoices::settle($pay, ['recorded' => false, 'status' => 'Paid', 'balance' => '0.00'])[0], 'note', 'paid some other way');
-    same(strpos(Invoices::settle($pay, ['recorded' => false, 'status' => 'Paid', 'balance' => '0.00'])[1], 'second payment') !== false, true);
-    same(Invoices::settle($pay, ['recorded' => false, 'status' => 'Cancelled', 'balance' => '25.00'])[0], 'note');
-    same(Invoices::settle($pay, ['recorded' => false, 'status' => 'Unpaid', 'balance' => '15.00'])[0], 'note', 'the balance changed');
+    $pay = ['pay', 'Paid.', '25.00', 'EUR'];
+    $now = function (array $over) {
+        return $over + ['recorded' => false, 'status' => 'Unpaid', 'balance' => '25.00', 'currency' => 'EUR'];
+    };
+    same(Invoices::settle($pay, $now([]))[0], 'add');
+    same(Invoices::settle($pay, $now(['balance' => '25']))[0], 'add');
+    same(Invoices::settle($pay, $now(['recorded' => true, 'status' => 'Paid', 'balance' => '0.00']))[0], 'ignore', 'added already');
+    same(Invoices::settle($pay, $now(['status' => 'Paid', 'balance' => '0.00']))[0], 'decline', 'paid some other way');
+    same(strpos(Invoices::settle($pay, $now(['status' => 'Paid', 'balance' => '0.00']))[1], 'second payment') !== false, true);
+    same(Invoices::settle($pay, $now(['status' => 'Cancelled']))[0], 'decline');
+    same(Invoices::settle($pay, $now(['balance' => '15.00']))[0], 'decline', 'the balance changed');
+    same(Invoices::settle($pay, $now(['currency' => 'USD']))[0], 'decline', 'the client is billed in another currency now: 25 USD is not 25 EUR');
     same(Invoices::settle(['note', 'x'], ['recorded' => false, 'status' => 'Unpaid', 'balance' => '25.00']), ['note', 'x']);
 });
 
@@ -441,12 +458,17 @@ check('paid after the balance changed, or after it was paid another way: logged,
     $host->invoices[7]['balance'] = '10.00';
     $body = json_encode(paidEvent('cs_1'));
     $handler->handleWebhook($body, sign($body, 'whsec_test'));
+    same($host->logs[count($host->logs) - 1][0], 'Note');
+    // The balance back at 25 and the webhook again: declined once, it stays the merchant's.
+    $host->invoices[7]['balance'] = '25.00';
+    $handler->handleWebhook($body, sign($body, 'whsec_test'));
+    same($host->payments, []);
+    [$host, $api, $handler] = setup();
+    $handler->startPayment(7);
     $host->invoices[7]['status'] = 'Paid';
     $handler->handleWebhook($body, sign($body, 'whsec_test'));
     same($host->payments, []);
-    same(array_map(function ($l) {
-        return $l[0];
-    }, array_slice($host->logs, -2)), ['Note', 'Note']);
+    same($host->logs[count($host->logs) - 1][0], 'Note', 'paid some other way');
 });
 
 check('the invoice held by another step: answered so SpotEx sends it again', function () {
@@ -511,11 +533,14 @@ check('a key that hands back another invoice\'s session (a copy of this WHMCS) i
     };
     same($handler->startPayment(7), 'https://spotex.trade/m/cs_ours');
     same($host->sessions[7]['attempt'], 2, 'the next try\'s key');
+    same(substr($api->created()[1][2]['Idempotency-Key'], -2), '-2');
     $api->routes['POST /checkout-sessions'] = [201, ['id' => 'cs_paid', 'url' => 'https://spotex.trade/m/cs_paid', 'status' => 'paid', 'order_id' => '7', 'price' => '25.00', 'currency' => 'EUR']];
     $api->routes['GET /checkout-sessions/cs_ours'] = [200, ['id' => 'cs_ours', 'status' => 'expired']];
     throws(function () use ($handler) {
         $handler->startPayment(7);
     }, ApiError::class, 'without a payment page');
+    same($host->sessions[7]['attempt'], 5, 'the refused tries are counted, so the next press asks with new keys');
+    same($host->sessions[7]['session_id'], 'cs_ours', 'and nothing else changes');
 });
 
 check('added once, never again: not after the transaction is deleted, nor for a release dressed as a payment', function () {
@@ -537,6 +562,42 @@ check('added once, never again: not after the transaction is deleted, nor for a 
     $handler->handleWebhook($released, sign($released, 'whsec_test'));
     same($host->payments, []);
     same($host->logs[count($host->logs) - 1][0], 'Note');
+});
+
+check('refunded and reopened: Pay makes a new page rather than sending the client back for ever', function () {
+    [$host, $api, $handler] = setup();
+    $handler->startPayment(7);
+    $body = json_encode(paidEvent('cs_1'));
+    $handler->handleWebhook($body, sign($body, 'whsec_test'));
+    $host->payments = [];
+    $host->invoices[7]['status'] = 'Unpaid';
+    $host->invoices[7]['balance'] = '25.00';
+    $api->routes['GET /checkout-sessions/cs_1'] = [200, ['id' => 'cs_1', 'status' => 'paid', 'checkout_id' => 'co_1']];
+    $api->routes['GET /checkouts/co_1'] = [200, paidEvent('cs_1')['data']['checkout'] + ['livemode' => true]];
+    same($handler->startPayment(7), 'https://spotex.trade/m/cs_2');
+    same($host->payments, [], 'the refunded one is not added again');
+});
+
+check('a second payment that was declined is never added later, nor after a change of currency', function () {
+    [$host, $api, $handler] = setup();
+    $handler->startPayment(7);
+    $api->routes['GET /checkout-sessions/cs_1'] = [200, ['id' => 'cs_1', 'status' => 'expired']];
+    $handler->startPayment(7);
+    foreach ([['cs_1', 'co_1'], ['cs_2', 'co_2']] as [$session, $id]) {
+        $body = json_encode(paidEvent($session, ['id' => $id]));
+        $handler->handleWebhook($body, sign($body, 'whsec_test'));
+    }
+    $host->invoices[7]['status'] = 'Unpaid';
+    $host->invoices[7]['balance'] = '25.00';
+    $again = json_encode(paidEvent('cs_2', ['id' => 'co_2']));
+    $handler->handleWebhook($again, sign($again, 'whsec_test'));
+    same($host->payments, [[7, 'co_1', '25.00']], 'the declined co_2 stays the merchant\'s to handle');
+    [$host, $api, $handler] = setup();
+    $handler->startPayment(7);
+    $host->currencies[3] = 'USD';
+    $body = json_encode(paidEvent('cs_1'));
+    $handler->handleWebhook($body, sign($body, 'whsec_test'));
+    same($host->payments, [], 'paid in EUR, billed in USD now: not added');
 });
 
 check('back from paying, but the balance changed meanwhile: not told it arrived', function () {

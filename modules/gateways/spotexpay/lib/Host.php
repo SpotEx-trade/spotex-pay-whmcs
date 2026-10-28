@@ -18,7 +18,7 @@ interface Host
 
     /**
      * What was kept when the invoice was sent to SpotEx: session_id, session_url, price, currency, attempt, test,
-     * earlier (each id, price, currency, test) and booked (the checkouts this module added to it).
+     * earlier (each id, price, currency, test) and booked (the checkouts this module added to it or declined).
      */
     public function session(int $invoiceId): ?array;
 
@@ -35,8 +35,11 @@ interface Host
      */
     public function recorded(int $invoiceId, string $transactionId): bool;
 
-    /** Adds the payment, and keeps its checkout among the invoice's booked ones. */
+    /** Adds the payment, and keeps its checkout among the invoice's handled ones. */
     public function addPayment(int $invoiceId, string $transactionId, string $amount): void;
+
+    /** Keeps a checkout among the invoice's handled ones without adding it: declined, so never added later. */
+    public function remember(int $invoiceId, string $transactionId): void;
 
     /** A line in WHMCS's gateway log. Never given a secret. */
     public function log(string $status, array $data): void;

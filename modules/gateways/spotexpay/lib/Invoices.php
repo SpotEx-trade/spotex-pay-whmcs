@@ -103,10 +103,12 @@ final class Invoices
 
     /**
      * What a webhook means for the invoice it names, given what was kept when
-     * the invoice was sent to SpotEx: ['pay', note, price] to add the payment
-     * (see settle()), ['test', note] for a test payment (never added: anyone
-     * with a test page's link can press its buttons), ['note', note] to log,
-     * or ['ignore', ''].
+     * the invoice was sent to SpotEx: ['pay', note, price, currency] to add
+     * the payment (see settle()), ['decline', note] for a payment that is
+     * never to be added (logged, and its checkout remembered so it never is
+     * later), ['test', note] for a test payment (never added: anyone with a
+     * test page's link can press its buttons), ['note', note] to log, or
+     * ['ignore', ''].
      *
      * @param array $kept session_id, price, currency and test of the session it was sent to last, and earlier: the
      *                    sessions it was sent to before, each id, price, currency and test
@@ -137,7 +139,7 @@ final class Invoices
         $type = (string) ($event['type'] ?? '');
         if ($type === 'checkout.paid') {
             if (!empty($checkout['duplicate'])) {
-                return ['note', "A second payment ({$what}) arrived for this invoice. It is in your SpotEx merchant wallet: refund it from the Merchant Center if it isn't wanted."];
+                return ['decline', "A second payment ({$what}) arrived for this invoice. It is in your SpotEx merchant wallet: refund it from the Merchant Center if it isn't wanted."];
             }
             $id = (string) ($checkout['id'] ?? '');
             // Released by SpotEx rather than accepted: comes as checkout.released, but never trust the type alone.
@@ -146,13 +148,13 @@ final class Invoices
             }
             $price = (string) ($checkout['price'] ?? '');
             if (($checkout['currency'] ?? '') !== $sent['currency'] || preg_match('/\A\d+(\.\d+)?\z/', $price) !== 1 || !self::sameAmount($price, $sent['price'])) {
-                return ['note', 'SpotEx reported a payment of ' . ($price ?: '?') . ' ' . ($checkout['currency'] ?? '') . ", not the {$sent['price']} {$sent['currency']} it was sent for, so it was not added."];
+                return ['decline', 'SpotEx reported a payment of ' . ($price ?: '?') . ' ' . ($checkout['currency'] ?? '') . ", not the {$sent['price']} {$sent['currency']} it was sent for, so it was not added."];
             }
             if (!$live) {
                 return ['test', "Test payment ({$what}, checkout {$id}): no real money, so it was not added."];
             }
             // Added only while the invoice still asks for exactly this much: settle() checks, under the lock.
-            return ['pay', "Paid with SpotEx Pay: {$what} (checkout {$id})." . (!empty($checkout['accepted_short']) ? ' Accepted short, within your setting or by you.' : ''), $sent['price']];
+            return ['pay', "Paid with SpotEx Pay: {$what} (checkout {$id})." . (!empty($checkout['accepted_short']) ? ' Accepted short, within your setting or by you.' : ''), $sent['price'], $sent['currency']];
         }
         if ($type === 'checkout.partial') {
             if (!empty($checkout['duplicate'])) {
@@ -160,8 +162,8 @@ final class Invoices
             }
             return ['note', "Part of the payment arrived ({$what}). SpotEx holds it until the rest does, or until you accept it in the Merchant Center."];
         }
-        if ($type === 'checkout.released') {
-            return ['note', "A part payment ({$what}) waited too long and SpotEx passed it to your merchant wallet. The invoice is NOT paid: ask the client for the rest, or refund it from the Merchant Center."];
+        if ($type === 'checkout.released' || ($checkout['status'] ?? '') === 'released') {
+            return ['note', self::releasedNote($checkout, $what)];
         }
         if ($type === 'checkout.extra') {
             return ['note', "More arrived after this invoice was paid ({$what}). It is in your SpotEx merchant wallet: refund the extra from the Merchant Center if it isn't wanted."];
@@ -172,15 +174,28 @@ final class Invoices
         return ['ignore', ''];
     }
 
+    /** What a payment SpotEx passed on without the merchant accepting it means for the invoice. */
+    private static function releasedNote(array $checkout, string $what): string
+    {
+        if (!empty($checkout['duplicate'])) {
+            return "A second payment for this invoice ({$what}), held by SpotEx, was passed to your merchant wallet. The invoice was paid already: refund it from the Merchant Center if it isn't wanted.";
+        }
+        if (!empty($checkout['paid_late'])) {
+            return "A late payment ({$what}), worth less than the invoice when it arrived, was passed to your merchant wallet without you accepting it. The invoice is NOT paid: add it by hand if you accept it, or refund it from the Merchant Center.";
+        }
+        $of = isset($checkout['amount'], $checkout['coin']) ? " of {$checkout['amount']} {$checkout['coin']}" : '';
+        return "A part payment ({$what}{$of}) waited too long, and SpotEx passed it to your merchant wallet. The invoice is NOT paid: add what arrived by hand if you accept it, or refund it from the Merchant Center. If the rest comes to the same address, the invoice is paid then.";
+    }
+
     /**
      * A 'pay' decision against the invoice as it is now, read under the
-     * invoice's lock: ['add', note] to add the payment, ['note', note] when
-     * the invoice no longer asks for it, or ['ignore', ''] when this checkout
-     * was added already (the webhook and the return check can both arrive).
-     * Other decisions pass through.
+     * invoice's lock: ['add', note] to add the payment, ['decline', note]
+     * when the invoice no longer asks for it, or ['ignore', ''] when this
+     * checkout was handled already (the webhook and the return check can both
+     * arrive). Other decisions pass through.
      *
-     * @param array $now recorded (this checkout was added before, to the books or by this module), status (WHMCS's),
-     *                   balance (as WHMCS gives it)
+     * @param array $now recorded (this checkout was handled before: on the books, or added or declined by this
+     *                   module), status (WHMCS's), balance (as WHMCS gives it), currency (the client's, now)
      */
     public static function settle(array $decision, array $now): array
     {
@@ -192,13 +207,16 @@ final class Invoices
         }
         $price = $decision[2];
         if ($now['status'] === 'Paid') {
-            return ['note', $decision[1] . ' The invoice was paid already, so this is a second payment: refund it from the SpotEx Merchant Center if it isn\'t wanted.'];
+            return ['decline', $decision[1] . ' The invoice was paid already, so this is a second payment: refund it from the SpotEx Merchant Center if it isn\'t wanted.'];
         }
         if ($now['status'] !== 'Unpaid') {
-            return ['note', $decision[1] . " The invoice is {$now['status']}, so it was not added: add it by hand, or refund it from the SpotEx Merchant Center."];
+            return ['decline', $decision[1] . " The invoice is {$now['status']}, so it was not added: add it by hand, or refund it from the SpotEx Merchant Center."];
+        }
+        if (($now['currency'] ?? '') !== $decision[3]) {
+            return ['decline', $decision[1] . " The client is billed in {$now['currency']} now, not the {$decision[3]} that was paid, so it was not added: add it by hand, or refund it from the SpotEx Merchant Center."];
         }
         if (!self::sameAmount((string) $now['balance'], $price)) {
-            return ['note', $decision[1] . " The invoice's balance is {$now['balance']} now, not the {$price} that was paid, so it was not added: add it by hand, or refund it from the SpotEx Merchant Center."];
+            return ['decline', $decision[1] . " The invoice's balance is {$now['balance']} now, not the {$price} that was paid, so it was not added: add it by hand, or refund it from the SpotEx Merchant Center."];
         }
         return ['add', $decision[1]];
     }

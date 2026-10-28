@@ -135,6 +135,11 @@ final class WhmcsHost implements Host
     public function addPayment(int $invoiceId, string $transactionId, string $amount): void
     {
         addInvoicePayment($invoiceId, $transactionId, $amount, 0, self::MODULE);
+        $this->remember($invoiceId, $transactionId);
+    }
+
+    public function remember(int $invoiceId, string $transactionId): void
+    {
         $session = $this->session($invoiceId);
         if ($session !== null) {
             $booked = array_slice(array_values(array_unique(array_merge($session['booked'], [$transactionId]))), -20);

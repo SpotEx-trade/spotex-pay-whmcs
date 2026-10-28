@@ -116,8 +116,8 @@ final class Handler
                 if (($last['status'] ?? '') === 'paid' && !empty($last['checkout_id'])) {
                     $checkout = $this->client(10)->retrieveCheckout((string) $last['checkout_id']);
                     $event = ['type' => 'checkout.paid', 'livemode' => ($checkout['livemode'] ?? false) === true, 'data' => ['checkout' => $checkout]];
-                    $done = $this->applyLocked($invoiceId, Invoices::eventAction($event, $kept), (string) ($checkout['id'] ?? ''));
-                    if ($done === 'added' || $done === 'recorded') {
+                    // Back to the invoice only if that added it: one handled before (refunded since, say) asks anew.
+                    if ($this->applyLocked($invoiceId, Invoices::eventAction($event, $kept), (string) ($checkout['id'] ?? '')) === 'added') {
                         return $this->invoiceUrl($invoiceId);
                     }
                 }
@@ -126,7 +126,7 @@ final class Handler
             $attempt = (int) ($kept['attempt'] ?? 0);
             $number = (string) ($invoice['invoicenum'] ?? '');
             $session = null;
-            for ($tries = 0; $tries < 2 && $session === null; $tries++) {
+            for ($tries = 0; $tries < 3 && $session === null; $tries++) {
                 $attempt++;
                 $answer = $this->createSession([
                     'price' => $price,
@@ -142,6 +142,10 @@ final class Handler
             $url = (string) ($session['url'] ?? '');
             $host = (string) parse_url(Client::BASE_URL, PHP_URL_HOST);
             if ($session === null || empty($session['id']) || strpos($url, 'https://' . $host . '/') !== 0) {
+                // Keep the tries counted, so the next press asks with new keys, not the same refused ones.
+                if ($kept !== null) {
+                    $this->host->saveSession($invoiceId, ['attempt' => $attempt] + $kept);
+                }
                 throw new ApiError(0, 'invalid_response', 'SpotEx Pay answered without a payment page for this invoice.');
             }
             // The sessions it was sent to before, each as it was sent: a payment on one of them still counts, or is logged.
@@ -230,13 +234,18 @@ final class Handler
         }
         $event = ['type' => 'checkout.paid', 'livemode' => ($checkout['livemode'] ?? false) === true, 'data' => ['checkout' => $checkout]];
         $done = $this->apply($invoiceId, Invoices::eventAction($event, $kept), (string) ($checkout['id'] ?? ''));
-        return $done === 'added' || $done === 'recorded' ? 'paid' : 'waiting';
+        if ($done === 'added') {
+            return 'paid';
+        }
+        // Handled before: paid only if the invoice says so (it may have been reopened since).
+        $invoice = $done === 'recorded' ? $this->host->invoice($invoiceId) : null;
+        return $invoice !== null && ($invoice['status'] ?? '') !== 'Unpaid' ? 'paid' : 'waiting';
     }
 
-    /** Does what was decided, taking the invoice's lock to add a payment. 'busy' when it could not be taken. */
+    /** Does what was decided, taking the invoice's lock to add or decline a payment. 'busy' when it could not be taken. */
     private function apply(int $invoiceId, array $decision, string $checkoutId): string
     {
-        if ($decision[0] !== 'pay') {
+        if ($decision[0] !== 'pay' && $decision[0] !== 'decline') {
             return $this->applyLocked($invoiceId, $decision, $checkoutId);
         }
         if (!$this->host->lock($invoiceId)) {
@@ -250,9 +259,10 @@ final class Handler
     }
 
     /**
-     * Does what was decided; a payment only while the caller holds the
-     * invoice's lock. 'added', 'recorded' (added before), 'note', 'logged'
-     * (a test payment or a note) or 'ignored'.
+     * Does what was decided; a payment added or declined only while the
+     * caller holds the invoice's lock. 'added', 'declined' (logged, and never
+     * to be added later), 'recorded' (handled before), 'logged' (a test
+     * payment or a note) or 'ignored'.
      */
     private function applyLocked(int $invoiceId, array $decision, string $checkoutId): string
     {
@@ -260,25 +270,33 @@ final class Handler
             return 'ignored';
         }
         $line = ['invoice' => $invoiceId, 'checkout' => $checkoutId, 'message' => $decision[1]];
-        if ($decision[0] !== 'pay') {
+        if ($decision[0] === 'test' || $decision[0] === 'note') {
             $this->host->log($decision[0] === 'test' ? 'Test payment' : 'Note', $line);
             return 'logged';
         }
-        $invoice = $this->host->invoice($invoiceId);
-        [$action, $note] = Invoices::settle($decision, [
-            'recorded' => $this->host->recorded($invoiceId, $checkoutId),
-            'status' => (string) ($invoice['status'] ?? 'missing'),
-            'balance' => (string) ($invoice['balance'] ?? ''),
-        ]);
-        if ($action === 'add') {
-            $this->host->addPayment($invoiceId, $checkoutId, $decision[2]);
-            $this->host->log('Success', ['message' => $note] + $line);
+        if ($this->host->recorded($invoiceId, $checkoutId)) {
+            return 'recorded';
+        }
+        $amount = (string) ($decision[2] ?? '');
+        if ($decision[0] === 'pay') {
+            $invoice = $this->host->invoice($invoiceId);
+            $decision = Invoices::settle($decision, [
+                'recorded' => false,
+                'status' => (string) ($invoice['status'] ?? 'missing'),
+                'balance' => (string) ($invoice['balance'] ?? ''),
+                'currency' => $invoice === null ? '' : $this->host->currencyCode((int) ($invoice['userid'] ?? 0)),
+            ]);
+        }
+        if ($decision[0] === 'add') {
+            $this->host->addPayment($invoiceId, $checkoutId, $amount);
+            $this->host->log('Success', $line);
             return 'added';
         }
-        if ($action === 'note') {
-            $this->host->log('Note', ['message' => $note] + $line);
-            return 'note';
+        // Declined: what the merchant does by hand is never doubled by this module adding it later.
+        if ($checkoutId !== '') {
+            $this->host->remember($invoiceId, $checkoutId);
         }
-        return 'recorded';
+        $this->host->log('Note', ['message' => $decision[1]] + $line);
+        return 'declined';
     }
 }
